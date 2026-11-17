@@ -1,10 +1,11 @@
 from pathlib import Path
-import ccxt
 import features_create as fc
 import mpl_plots as mpl
+import ai_model as ai
 import numpy as np
 import pandas as pd
 import data_get
+from sklearn.metrics import accuracy_score, classification_report
 
 PLOTS = Path(__file__).parent.resolve() / "plots"
 PLOTS.mkdir(exist_ok=True)
@@ -21,6 +22,7 @@ y_raw[next_close.isna()] = np.nan
 features = fc.FeatureCreator(data)
 
 # Доходности (returns)
+ret1 = features.ret(1)
 ret4 = features.ret(4)
 ret12 = features.ret(12)
 ret24 = features.ret(24)
@@ -44,6 +46,7 @@ vol_change = data["volume"].pct_change(1)
 data_new = (
     pd.DataFrame({
         # returns
+        "ret_1": ret1,
         "ret_4": ret4,
         "ret_12": ret12,
         "ret_24": ret24,
@@ -77,6 +80,7 @@ print("\nПример первой валидной строки (значени
 print(data_new.iloc[0].round(5).to_string())
 
 X = data_new[[
+    "ret_1",
     "ret_4",
     "ret_12",
     "ret_24",
@@ -197,6 +201,64 @@ for name, arr in [
     assert not arr.isna().any().any(), f"Обнаружены NaN в {name} после нормализации!"
 
 print("\n[OK] Все проверки пройдены успешно, утечек данных и NaN не обнаружено.")
-#тут все отладочные принты описывал gemini
 
-mpl.plot_correlation_matrix(X)
+# 1. Распределение классов (объединяем количество и проценты в одну аккуратную таблицу)
+print("=" * 55)
+print("1. РАСПРЕДЕЛЕНИЕ КЛАССОВ В ВЫБОРКАХ")
+print("=" * 55)
+
+for name, target in [
+    ("Train (Обучающая)", y_train),
+    ("Validation (Валидационная)", y_validation),
+    ("Test (Тестовая)", y_test)
+]:
+    summary_df = pd.DataFrame({
+        "Количество (шт.)": target.value_counts(),
+        "Доля (%)": (target.value_counts(normalize=True) * 100).round(2)
+    })
+    print(f"\nВыборка: {name} | Всего строк: {len(target)}")
+    print(summary_df)
+
+
+# 2. Метрики базовой модели
+print("\n" + "=" * 55)
+print("2. BASELINE МОДЕЛЬ (константное предсказание: все нули)")
+print("=" * 55)
+
+baseline_predictions = np.zeros(len(y_test), dtype=int)
+baseline_accuracy = accuracy_score(y_test, baseline_predictions)
+
+print(f"Точность (Accuracy): {baseline_accuracy:.4f} ({baseline_accuracy * 100:.2f}%)\n")
+print("Подробный отчет по классам (Classification Report):")
+print(classification_report(
+    y_test,
+    baseline_predictions,
+    zero_division=0
+))
+
+
+# 3. Корреляция признаков с целевой переменной
+print("=" * 55)
+print("3. КОРРЕЛЯЦИЯ ПРИЗНАКОВ С TARGET (на Train выборке)")
+print("=" * 55)
+
+# Добавлено numeric_only=True на случай, если в X_train остались категориальные/текстовые колонки
+corr_target = pd.concat(
+    [X_train, y_train.rename("target")],
+    axis=1
+).corr(numeric_only=True)["target"].drop("target")
+
+print("Отсортировано от сильной прямой до сильной обратной связи:\n")
+print(corr_target.sort_values(ascending=False).round(4))
+print("=" * 55)
+
+# mpl.plot_correlation_matrix(X)
+# mpl.plot_price_splits(data["close"], X_train, X_validation, X_test, window = 24)
+
+#все отладочные принты описывал gemini
+
+model = ai.LogisticRegression(learning_rate=1, epochs=10000)
+model.fit(X_train, y_train)
+y_hat = model.predict(X_validation)
+
+# mpl.plot_match_over_time(y_validation, y_hat)

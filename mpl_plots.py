@@ -31,12 +31,22 @@ contents:
     plot_normalized            one normalized feature, 3 splits in time
     plot_normalized_box        boxplots of all normalized features, 3 splits
     plot_split_distributions   one feature: train / val / test distributions
+  model evaluation (y vs y_hat)
+    plot_match_over_time       match / mismatch of y and y_hat in time
+    plot_confusion_matrix      confusion matrix (counts and % per true class)
+    plot_metrics_by_split      accuracy train / val / test vs baseline
+    plot_proba_hist            predicted probabilities by true class
+    plot_roc_curve             ROC curve and AUC
+    plot_calibration           predicted probability vs real frequency
+    plot_threshold_scan        accuracy / precision / recall / F1 vs threshold
+    plot_strategy_equity       equity curve of a trading rule vs buy & hold
+    plot_training_history      loss (and metric) per epoch
 '''
-#в этот модуль опасно лезть, тк я не люблю матплотлиб я это все навайбкодил но в какой то момент клод вышел из под контроля и написал 700 строк
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from pathlib import Path
 
 try:
@@ -729,3 +739,519 @@ def plot_split_distributions(train: pd.Series,
     _finish(fig, name, show, plots_dir)
 
     return _ks_stat(train, test)
+
+
+# =====================================================================
+# model evaluation (y vs y_hat)
+#
+# y      - true target (0 / 1), pd.Series with DatetimeIndex
+# y_hat  - model output: labels 0 / 1 OR probabilities of class 1.
+#          a label is made as (y_hat >= threshold), default 0.5.
+#          numpy arrays (model.predict) are accepted: they get y.index.
+# y_proba - probabilities only (functions that need a score, not a label)
+#
+# important: choose the threshold on VALIDATION, report on TEST once.
+# =====================================================================
+
+C_MATCH = "#2CA02C"
+C_MISS = "#D62728"
+
+
+def _pair(y, y_hat) -> tuple[pd.Series, pd.Series]:
+    '''
+    align y and y_hat by index, drop NaN. y_hat may be a numpy array
+    (then it takes the index of y). returns (y as int, y_hat as float).
+    '''
+    if not isinstance(y_hat, pd.Series):
+        y_hat = pd.Series(np.asarray(y_hat, dtype=float).ravel(), index=y.index)
+    df = pd.concat([y, y_hat], axis=1, keys=["y", "y_hat"]).dropna()
+    return df["y"].astype(int), df["y_hat"].astype(float)
+
+
+def _metrics(y: np.ndarray, pred: np.ndarray) -> tuple[float, float, float, float]:
+    '''
+    accuracy, precision, recall, f1 for class 1. 0.0 instead of 0 / 0.
+    '''
+    tp = int(np.sum((y == 1) & (pred == 1)))
+    fp = int(np.sum((y == 0) & (pred == 1)))
+    fn = int(np.sum((y == 1) & (pred == 0)))
+    tn = int(np.sum((y == 0) & (pred == 0)))
+    n = tp + fp + fn + tn
+    acc = (tp + tn) / n if n else float("nan")
+    prec = tp / (tp + fp) if (tp + fp) else 0.0
+    rec = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+    return acc, prec, rec, f1
+
+
+def plot_match_over_time(y: pd.Series,
+                         y_hat,
+                         threshold: float = 0.5,
+                         window: int = 24,
+                         name: str = "match_over_time.png",
+                         show: bool = True,
+                         plots_dir: Path = PLOTS) -> float:
+    '''
+    match / mismatch of y and y_hat in time.
+    top: rolling accuracy (window rows), dashed red = 0.5 (coin flip),
+    dotted = overall accuracy.
+    bottom: one thin line per row, green = model was right,
+    red = model was wrong. shows WHEN the model works: long red
+    stretches = regime where it fails.
+
+    params:
+    y: pd.Series of 0/1 with DatetimeIndex
+    y_hat: labels 0/1 or probabilities (pd.Series or numpy array)
+    threshold: y_hat >= threshold -> class 1
+    window: rolling window in rows (24 = one day of hourly data)
+
+    return:
+    float - overall accuracy (share of matches)
+    '''
+    yy, p = _pair(y, y_hat)
+    match = (yy == (p >= threshold).astype(int))
+    acc = float(match.mean())
+
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(11, 5), sharex=True,
+        gridspec_kw={"height_ratios": [3, 1]},
+    )
+    ax1.plot(match.astype(float).rolling(window).mean(), color="black", lw=1.2,
+             label=f"rolling accuracy ({window})")
+    ax1.axhline(0.5, color="red", linestyle="--", label="0.5")
+    ax1.axhline(acc, color=C_VAL, linestyle=":", label=f"overall {acc:.1%}")
+    ax1.set_ylim(0, 1)
+    ax1.set_ylabel("accuracy")
+    ax1.set_title("Match of y and y_hat")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+
+    colors = np.where(match.to_numpy(), C_MATCH, C_MISS)
+    ax2.vlines(match.index, 0, 1, colors=colors, lw=1)
+    ax2.set_ylim(0, 1)
+    ax2.set_yticks([])
+    ax2.set_xlabel("date")
+    ax2.legend(handles=[Line2D([0], [0], color=C_MATCH, lw=3, label="match"),
+                        Line2D([0], [0], color=C_MISS, lw=3, label="mismatch")],
+               loc="upper right", ncol=2, fontsize=8)
+
+    fig.autofmt_xdate()
+    _finish(fig, name, show, plots_dir)
+    return acc
+
+
+def plot_confusion_matrix(y: pd.Series,
+                          y_hat,
+                          threshold: float = 0.5,
+                          name: str = "confusion_matrix.png",
+                          show: bool = True,
+                          plots_dir: Path = PLOTS) -> float:
+    '''
+    confusion matrix 2 x 2: rows = true class, columns = predicted class.
+    every cell: count and % of its true-class row. color = % of the row
+    (fixed scale 0..1). diagonal = matches. if the model always says
+    "up", one column is empty - this plot shows that at once, while
+    plain accuracy hides it. precision / recall / F1 are in the title.
+
+    params:
+    y: pd.Series of 0/1
+    y_hat: labels 0/1 or probabilities
+    threshold: y_hat >= threshold -> class 1
+
+    return:
+    float - accuracy
+    '''
+    yy, p = _pair(y, y_hat)
+    yv = yy.to_numpy()
+    pred = (p >= threshold).astype(int).to_numpy()
+
+    cm = np.zeros((2, 2), dtype=int)
+    for t in (0, 1):
+        for q in (0, 1):
+            cm[t, q] = int(np.sum((yv == t) & (pred == q)))
+    row = cm.sum(axis=1, keepdims=True)
+    share = np.divide(cm, row, out=np.zeros(cm.shape, dtype=float), where=row > 0)
+    acc, prec, rec, f1 = _metrics(yv, pred)
+
+    fig, ax = plt.subplots(figsize=(5, 4.5))
+    im = ax.imshow(share, cmap="Blues", vmin=0, vmax=1)
+    for i in range(2):
+        for j in range(2):
+            ax.text(j, i, f"{cm[i, j]}\n{share[i, j]:.1%}", ha="center", va="center",
+                    color="white" if share[i, j] > 0.6 else "black")
+    ax.set_xticks([0, 1])
+    ax.set_xticklabels(["down (0)", "up (1)"])
+    ax.set_yticks([0, 1])
+    ax.set_yticklabels(["down (0)", "up (1)"])
+    ax.set_xlabel("predicted")
+    ax.set_ylabel("true")
+    ax.set_title(f"acc {acc:.3f} | prec {prec:.3f} | rec {rec:.3f} | F1 {f1:.3f}",
+                 fontsize=10)
+    fig.colorbar(im, ax=ax, label="share of true class", fraction=0.046, pad=0.04)
+    _finish(fig, name, show, plots_dir)
+    return float(acc)
+
+
+def plot_metrics_by_split(y_train: pd.Series, y_hat_train,
+                          y_validation: pd.Series, y_hat_validation,
+                          y_test: pd.Series, y_hat_test,
+                          threshold: float = 0.5,
+                          name: str = "metrics_by_split.png",
+                          show: bool = True,
+                          plots_dir: Path = PLOTS) -> float:
+    '''
+    accuracy of the model on train / validation / test (colored bars,
+    black whiskers = 95% binomial confidence interval) next to a
+    baseline "always predict the majority class of train" (gray).
+    dashed line = 0.5. the model is useful only if its bar is above
+    the baseline AND the whisker does not touch it. big gap between
+    train and validation = overfitting. with ~150 rows in a split the
+    interval is about +-8 p.p., so small differences are noise.
+
+    params:
+    y_*: pd.Series of 0/1 for each split
+    y_hat_*: labels or probabilities for each split
+    threshold: y_hat >= threshold -> class 1
+
+    return:
+    float - accuracy(train) minus accuracy(test) (overfitting gap)
+    '''
+    pairs = [_pair(a, b) for a, b in ((y_train, y_hat_train),
+                                      (y_validation, y_hat_validation),
+                                      (y_test, y_hat_test))]
+    majority = int(pairs[0][0].mean() >= 0.5)  # from train only
+
+    accs, errs, bases = [], [], []
+    for yy, p in pairs:
+        acc = float(np.mean(yy.to_numpy() == (p >= threshold).astype(int).to_numpy()))
+        n = len(yy)
+        accs.append(acc)
+        errs.append(1.96 * np.sqrt(acc * (1 - acc) / n))
+        bases.append(float(np.mean(yy.to_numpy() == majority)))
+
+    x = np.arange(3)
+    w = 0.38
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.bar(x - w / 2, accs, w, yerr=errs, capsize=4,
+           color=[C_TRAIN, C_VAL, C_TEST], label="model")
+    ax.bar(x + w / 2, bases, w, color="gray", alpha=0.6,
+           label=f"baseline (always {majority})")
+    for xi, a in zip(x, accs):
+        ax.text(xi - w / 2, 0.02, f"{a:.1%}", ha="center", color="white",
+                fontweight="bold")
+    ax.axhline(0.5, color="red", linestyle="--")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(["train", "validation", "test"])
+    ax.set_ylim(0, 1)
+    ax.set_ylabel("accuracy")
+    ax.set_title("Accuracy by split")
+    ax.legend(loc="upper right")
+    _finish(fig, name, show, plots_dir)
+    return float(accs[0] - accs[2])
+
+
+def plot_proba_hist(y: pd.Series,
+                    y_proba,
+                    threshold: float = 0.5,
+                    bins: int = 20,
+                    name: str = "proba_hist.png",
+                    show: bool = True,
+                    plots_dir: Path = PLOTS) -> float:
+    '''
+    histogram of predicted probabilities, separately for rows where the
+    truth is "up" and "down", on the same bins (0..1) and the same axes.
+    if the two histograms lie on top of each other, the model does not
+    separate the classes. if everything sits in a narrow peak near 0.5,
+    the model is unsure about everything. dashed line = threshold.
+
+    params:
+    y: pd.Series of 0/1
+    y_proba: probabilities of class 1 (0..1)
+
+    return:
+    float - mean probability for y=1 minus mean probability for y=0
+    (0 = no separation)
+    '''
+    yy, p = _pair(y, y_proba)
+    edges = np.linspace(0, 1, bins + 1)
+    p0 = p[yy == 0]
+    p1 = p[yy == 1]
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.hist(p0, bins=edges, alpha=0.6, color=C_MISS, label="true: down (0)")
+    ax.hist(p1, bins=edges, alpha=0.6, color=C_MATCH, label="true: up (1)")
+    ax.axvline(threshold, color="black", linestyle="--", label=f"threshold {threshold}")
+
+    ax.set_title("Predicted probability by true class")
+    ax.set_xlabel("predicted probability of up")
+    ax.set_ylabel("count")
+    ax.set_xlim(0, 1)
+    ax.legend()
+    _finish(fig, name, show, plots_dir)
+
+    if len(p0) == 0 or len(p1) == 0:
+        return float("nan")
+    return float(p1.mean() - p0.mean())
+
+
+def plot_roc_curve(y: pd.Series,
+                   y_proba,
+                   name: str = "roc_curve.png",
+                   show: bool = True,
+                   plots_dir: Path = PLOTS) -> float:
+    '''
+    ROC curve (false positive rate vs true positive rate) over all
+    thresholds. diagonal = random guessing (AUC 0.5). AUC does not
+    depend on the threshold, so it is a good way to compare models.
+    for hourly crypto an AUC of 0.50-0.53 is normal; above 0.6 on
+    test - check for leakage first.
+
+    params:
+    y: pd.Series of 0/1
+    y_proba: probabilities (or any score, higher = more "up")
+
+    return:
+    float - AUC (area under the curve), nan if only one class in y
+    '''
+    yy, s = _pair(y, y_proba)
+    yv = yy.to_numpy()
+    sv = s.to_numpy()
+
+    order = np.argsort(-sv, kind="mergesort")
+    ys, ss = yv[order], sv[order]
+    idx = np.r_[np.where(np.diff(ss))[0], len(ys) - 1]  # last row of each score
+    tps = np.cumsum(ys)[idx]
+    fps = (idx + 1) - tps
+    pos, neg = tps[-1], fps[-1]
+
+    fig, ax = plt.subplots(figsize=(5.5, 5))
+    if pos == 0 or neg == 0:
+        auc = float("nan")
+    else:
+        tpr = np.r_[0.0, tps / pos]
+        fpr = np.r_[0.0, fps / neg]
+        auc = float(np.sum(np.diff(fpr) * (tpr[1:] + tpr[:-1]) / 2))
+        ax.plot(fpr, tpr, color=C_VAL, lw=2, label=f"model (AUC {auc:.3f})")
+    ax.plot([0, 1], [0, 1], color="red", linestyle="--", label="random (0.5)")
+
+    ax.set_title("ROC curve")
+    ax.set_xlabel("false positive rate")
+    ax.set_ylabel("true positive rate")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="lower right")
+    _finish(fig, name, show, plots_dir)
+    return auc
+
+
+def plot_calibration(y: pd.Series,
+                     y_proba,
+                     bins: int = 10,
+                     name: str = "calibration.png",
+                     show: bool = True,
+                     plots_dir: Path = PLOTS) -> float:
+    '''
+    calibration: predicted probability (x) vs how often "up" really
+    happened in that bucket (y). diagonal = perfectly calibrated
+    ("70% means 7 of 10"). below the plot - how many predictions fall
+    into each bucket (the same x axis): points built on a few rows are
+    not reliable.
+
+    params:
+    y: pd.Series of 0/1
+    y_proba: probabilities (0..1)
+    bins: number of equal-width probability buckets
+
+    return:
+    float - ECE (expected calibration error): weighted mean
+    |real frequency - predicted probability|. 0 = ideal.
+    '''
+    yy, p = _pair(y, y_proba)
+    yv = yy.to_numpy()
+    pv = p.to_numpy()
+    edges = np.linspace(0, 1, bins + 1)
+    which = np.clip(np.digitize(pv, edges[1:-1]), 0, bins - 1)
+
+    xs, ys, counts = [], [], []
+    ece = 0.0
+    for b in range(bins):
+        m = which == b
+        if m.sum() == 0:
+            continue
+        xs.append(pv[m].mean())
+        ys.append(yv[m].mean())
+        counts.append(int(m.sum()))
+        ece += m.sum() / len(pv) * abs(yv[m].mean() - pv[m].mean())
+
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(6, 6.5), sharex=True,
+        gridspec_kw={"height_ratios": [3, 1]},
+    )
+    ax1.plot([0, 1], [0, 1], color="red", linestyle="--", label="ideal")
+    ax1.plot(xs, ys, color=C_VAL, marker="o", label=f"model (ECE {ece:.3f})")
+    ax1.set_ylim(0, 1)
+    ax1.set_ylabel("real share of up")
+    ax1.set_title("Calibration")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc="upper left")
+
+    ax2.hist(pv, bins=edges, color="gray", edgecolor="white")
+    ax2.set_xlim(0, 1)
+    ax2.set_xlabel("predicted probability of up")
+    ax2.set_ylabel("count")
+    _finish(fig, name, show, plots_dir)
+    return float(ece)
+
+
+def plot_threshold_scan(y: pd.Series,
+                        y_proba,
+                        name: str = "threshold_scan.png",
+                        show: bool = True,
+                        plots_dir: Path = PLOTS) -> float:
+    '''
+    accuracy, precision, recall and F1 for every threshold from 0.05
+    to 0.95. vertical dotted line = threshold with the best accuracy.
+    use VALIDATION data here and then fix the threshold for test:
+    choosing it on test is a leak.
+
+    params:
+    y: pd.Series of 0/1
+    y_proba: probabilities (0..1)
+
+    return:
+    float - threshold with the best accuracy
+    '''
+    yy, p = _pair(y, y_proba)
+    yv = yy.to_numpy()
+    pv = p.to_numpy()
+    grid = np.linspace(0.05, 0.95, 91)
+    res = np.array([_metrics(yv, (pv >= t).astype(int)) for t in grid])  # (T, 4)
+    best = float(grid[int(np.nanargmax(res[:, 0]))])
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    for k, lbl in enumerate(("accuracy", "precision", "recall", "F1")):
+        ax.plot(grid, res[:, k], lw=1.8 if k == 0 else 1.2, label=lbl)
+    ax.axhline(0.5, color="red", linestyle="--", lw=0.8)
+    ax.axvline(best, color="black", linestyle=":", label=f"best acc @ {best:.2f}")
+
+    ax.set_title("Metrics vs threshold")
+    ax.set_xlabel("threshold")
+    ax.set_ylabel("metric")
+    ax.set_ylim(0, 1)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    _finish(fig, name, show, plots_dir)
+    return best
+
+
+def plot_strategy_equity(next_ret: pd.Series,
+                         y_hat,
+                         threshold: float = 0.5,
+                         long_short: bool = True,
+                         fee: float = 0.001,
+                         name: str = "strategy_equity.png",
+                         show: bool = True,
+                         plots_dir: Path = PLOTS) -> float:
+    '''
+    equity curve of the rule "y_hat = 1 -> buy, y_hat = 0 -> sell
+    (or stay out)" against buy & hold. accuracy can be 53% and still
+    lose money after fees, so this is the real test of the model.
+    start = 1.0. the fee is charged on every change of position.
+
+    params:
+    next_ret: pd.Series, price return from this row to the NEXT row,
+    for example close.shift(-1) / close - 1. it is the future, so it is
+    used only here, never as a feature. last row (NaN) is dropped.
+    y_hat: labels or probabilities, same index
+    threshold: y_hat >= threshold -> class 1
+    long_short: True = +1 / -1 position, False = +1 / 0 (long only)
+    fee: cost per unit of position change (0.001 = 0.1%)
+
+    return:
+    float - total return of the strategy (0.05 = +5%)
+    '''
+    if not isinstance(y_hat, pd.Series):
+        y_hat = pd.Series(np.asarray(y_hat, dtype=float).ravel(), index=next_ret.index)
+    df = pd.concat([next_ret, y_hat], axis=1, keys=["r", "p"]).dropna()
+    r = df["r"].astype(float)  # not _pair(): it would cast returns to int
+    pred = (df["p"] >= threshold).astype(int)
+
+    pos = np.where(pred.to_numpy() == 1, 1.0, -1.0 if long_short else 0.0)
+    turnover = np.abs(np.diff(np.r_[0.0, pos]))
+    strat = pos * r.to_numpy() - fee * turnover
+    equity = pd.Series(np.cumprod(1 + strat), index=r.index)
+    hold = pd.Series(np.cumprod(1 + r.to_numpy()), index=r.index)
+
+    fig, ax = plt.subplots(figsize=(11, 4))
+    ax.plot(hold, color="gray", lw=1.2, label=f"buy & hold ({hold.iloc[-1] - 1:+.1%})")
+    ax.plot(equity, color=C_VAL, lw=1.6,
+            label=f"strategy ({equity.iloc[-1] - 1:+.1%}, fee {fee:.2%})")
+    ax.axhline(1.0, color="black", linestyle="--", lw=0.8)
+
+    ax.set_title("Equity: " + ("long / short" if long_short else "long only"))
+    ax.set_xlabel("date")
+    ax.set_ylabel("equity (start = 1)")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.autofmt_xdate()
+    _finish(fig, name, show, plots_dir)
+    return float(equity.iloc[-1] - 1)
+
+
+def plot_training_history(train_loss,
+                          val_loss,
+                          train_metric=None,
+                          val_metric=None,
+                          metric_name: str = "accuracy",
+                          name: str = "training_history.png",
+                          show: bool = True,
+                          plots_dir: Path = PLOTS) -> int:
+    '''
+    learning curves per epoch: loss on train and validation (left),
+    and optionally a metric (right). dotted vertical line = epoch with
+    the lowest validation loss. validation loss going up while train
+    loss goes down = overfitting, stop earlier (early stopping).
+
+    params:
+    train_loss, val_loss: lists / arrays, one value per epoch
+    train_metric, val_metric: optional lists, for example accuracy
+    metric_name: label of the metric
+
+    return:
+    int - best epoch (1-based) by validation loss
+    '''
+    tl = np.asarray(train_loss, dtype=float)
+    vl = np.asarray(val_loss, dtype=float)
+    epochs = np.arange(1, len(tl) + 1)
+    best = int(np.nanargmin(vl)) + 1
+
+    with_metric = train_metric is not None and val_metric is not None
+    ncols = 2 if with_metric else 1
+    fig, axes = plt.subplots(1, ncols, figsize=(5.5 * ncols + 1, 4), squeeze=False)
+
+    ax = axes[0, 0]
+    ax.plot(epochs, tl, color=C_TRAIN, label="train")
+    ax.plot(epochs, vl, color=C_VAL, label="validation")
+    ax.axvline(best, color="black", linestyle=":", label=f"best epoch {best}")
+    ax.set_title("Loss")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("loss")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    if with_metric:
+        ax = axes[0, 1]
+        ax.plot(epochs, np.asarray(train_metric, dtype=float), color=C_TRAIN, label="train")
+        ax.plot(epochs, np.asarray(val_metric, dtype=float), color=C_VAL, label="validation")
+        ax.axvline(best, color="black", linestyle=":")
+        ax.set_title(metric_name)
+        ax.set_xlabel("epoch")
+        ax.set_ylabel(metric_name)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+    _finish(fig, name, show, plots_dir)
+    return best
